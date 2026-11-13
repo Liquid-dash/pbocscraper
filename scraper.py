@@ -325,11 +325,32 @@ def merge_with_master(new: pd.DataFrame) -> pd.DataFrame:
     return new
 
 
+def prepare_master(merged: pd.DataFrame) -> pd.DataFrame:
+    """The master exactly as it will be written: one row per key (last wins), sorted."""
+    return (merged.drop_duplicates(subset=KEY_COLUMNS, keep="last")
+                  .sort_values(KEY_COLUMNS)
+                  .reset_index(drop=True))[MASTER_COLUMNS]
+
+
+def same_content(a: pd.DataFrame, b: pd.DataFrame) -> bool:
+    """Content comparison that ignores dtype noise from the Excel round trip (e.g. a value
+    column read back as int64, or str vs object columns)."""
+    if a.shape != b.shape:
+        return False
+    a, b = a.reset_index(drop=True), b.reset_index(drop=True)
+    for c in MASTER_COLUMNS:
+        if c == "value":
+            x, y = pd.to_numeric(a[c], errors="coerce"), pd.to_numeric(b[c], errors="coerce")
+            if not ((x - y).abs().le(1e-9) | (x.isna() & y.isna())).all():
+                return False
+        elif not a[c].fillna("").astype(str).equals(b[c].fillna("").astype(str)):
+            return False
+    return True
+
+
 def write_master(merged: pd.DataFrame) -> int:
     DATA_DIR.mkdir(exist_ok=True)
-    merged = (merged.drop_duplicates(subset=KEY_COLUMNS, keep="last")
-                    .sort_values(KEY_COLUMNS)
-                    .reset_index(drop=True))[MASTER_COLUMNS]
+    merged = prepare_master(merged)
     tmp = MASTER_PATH.with_suffix(".tmp.xlsx")
     merged.to_excel(tmp, index=False, sheet_name="data")
     tmp.replace(MASTER_PATH)
@@ -808,8 +829,15 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
     # happen before de-duplication so old Chinese keys collapse onto the English ones.
     n_known = len(translations)
     translated = translate_columns(merged, selector, translations)
-    if not new.empty or not translated.equals(merged):
-        total = write_master(translated)
+    # Rewrite only on a real content change: an unchanged run must leave the file untouched
+    # so the workflow has nothing to commit (a re-saved .xlsx differs byte-wise).
+    final = prepare_master(translated)
+    old = (prepare_master(pd.read_excel(MASTER_PATH, dtype={"period": str}))
+           if MASTER_PATH.exists() else None)
+    if old is not None and same_content(final, old):
+        log.info("Master unchanged (%d rows); not rewritten", len(final))
+    elif not final.empty:
+        total = write_master(final)
         log.info("Upserted %d new records; master now has %d rows", len(new), total)
     if len(translations) != n_known:
         save_json(TRANSLATIONS_PATH, translations)
