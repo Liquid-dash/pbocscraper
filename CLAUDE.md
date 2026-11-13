@@ -27,8 +27,10 @@ long-format master spreadsheet in `data/`.
 
 ## Pipeline
 
-1. **Crawl** (Playwright, headless Chromium, `wait_until="networkidle"`, random 2-5 s delay between
-   requests). `--years N` limits to the newest N year sections (default 1).
+1. **Crawl** (Playwright, headless Chromium, random 2-5 s delay between requests). Only HTML
+   documents are loaded (`block_subresources` aborts scripts/CSS/images) with
+   `wait_until="domcontentloaded"` and 3 attempts per page: the link tables are static HTML, but the
+   site's scripts take 30+ s and made `networkidle` time out on GitHub runners. `--years N` limits to the newest N year sections (default 1).
 2. **Select links** with Claude (`claude-haiku-4-5`, `client.messages.parse` + Pydantic):
    `PageSelection` for category pages, `AttachmentSelection` for spreadsheets (tags each as
    `money_supply` / `afre_flow` / `afre_stock`). Returned URLs are validated against the candidate

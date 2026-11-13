@@ -33,7 +33,7 @@ from typing import Literal
 import pandas as pd
 from pydantic import BaseModel, Field
 
-INDEX_URL = "http://www.pbc.gov.cn/diaochatongjisi/116219/116319/index.html"
+INDEX_URL = "https://www.pbc.gov.cn/diaochatongjisi/116219/116319/index.html"
 STATS_PATH = "/diaochatongjisi/116219/116319/"
 MODEL = "claude-haiku-4-5"
 
@@ -207,10 +207,31 @@ LINK_JS = """els => els.map(e => {
 })"""
 
 
+GOTO_ATTEMPTS = 3
+
+
+def block_subresources(route) -> None:
+    """Load only HTML documents. The link tables are static HTML, while the site's
+    scripts/CSS take 30+ s to load (long enough to time out from GitHub runners)."""
+    if route.request.resource_type == "document":
+        route.continue_()
+    else:
+        route.abort()
+
+
 def goto(page, url: str) -> None:
-    resp = page.goto(url, wait_until="networkidle", timeout=90_000)
-    if resp is None or not resp.ok:
-        raise RuntimeError(f"GET {url} failed: {resp.status if resp else 'no response'}")
+    for attempt in range(1, GOTO_ATTEMPTS + 1):
+        try:
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            if resp is None or not resp.ok:
+                raise RuntimeError(f"GET {url} failed: {resp.status if resp else 'no response'}")
+            return
+        except Exception as exc:
+            if attempt == GOTO_ATTEMPTS:
+                raise
+            log.warning("GET %s failed (attempt %d/%d): %s", url, attempt, GOTO_ATTEMPTS,
+                        str(exc).splitlines()[0])
+            time.sleep(10 * attempt)
 
 
 def collect_category_pages(page, years: int) -> list[Link]:
@@ -478,6 +499,7 @@ def run(dry_run: bool, years: int, max_files: int | None) -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(locale="zh-CN")
+        context.route("**/*", block_subresources)
         page = context.new_page()
         try:
             categories = collect_category_pages(page, years)
