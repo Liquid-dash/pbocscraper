@@ -710,12 +710,16 @@ def process_file(selector, content: bytes, link: Link, dataset: str,
 
 # --------------------------------------------------------------------------- main
 
-def run(dry_run: bool, years: int, max_files: int | None) -> int:
+def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) -> int:
     from playwright.sync_api import sync_playwright
 
     if dry_run:
         selector = HeuristicSelector()
         log.info("DRY RUN: keyword/heuristic selection, nothing written to %s", DATA_DIR)
+    elif no_llm:
+        selector = HeuristicSelector()
+        log.info("NO-LLM live run: keyword/heuristic selection; labels missing from %s stay "
+                 "untranslated until the next Claude run", TRANSLATIONS_PATH.name)
     else:
         if not os.environ.get("ANTHROPIC_API_KEY"):
             log.error("ANTHROPIC_API_KEY is not set (use --dry-run to test without it)")
@@ -830,12 +834,15 @@ def main() -> None:
                     help="How many of the most recent year sections to crawl (default 1)")
     ap.add_argument("--max-files", type=int, default=None,
                     help="Cap on new files processed this run")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="Live run (writes data/) with heuristic selection instead of Claude; "
+                    "no API key needed. For fetching files the runners can't reach.")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
-    sys.exit(run(args.dry_run, args.years, args.max_files))
+    sys.exit(run(args.dry_run, args.years, args.max_files, args.no_llm))
 
 
 if __name__ == "__main__":

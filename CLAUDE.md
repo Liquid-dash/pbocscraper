@@ -74,6 +74,11 @@ long-format master spreadsheet in `data/`.
 no failures, or after `BACKFILL_MAX_ATTEMPTS` (3) attempts; after that runs crawl `--years`
 (default 1, i.e. the latest year only). Delete `data/state.json` to backfill again.
 
+The pre-2015 `/eportal/` `.htm` files 404 almost every time from GitHub runners (over both http
+and https) but load fine from a normal connection, so the Nov 2026 backfill fetched them locally
+with `--no-llm` (heuristic selection/layout, no API key; writes `data/`). Labels not yet in
+`translations.json` stay Chinese until the next Claude run, which re-translates the whole master.
+
 ## Rules
 
 - **LLM decides layout, code moves data.** Claude only returns row/column indices, labels and label
@@ -102,4 +107,5 @@ python scraper.py --dry-run            # crawl + parse, no API key, no writes
 python scraper.py                      # live run (needs ANTHROPIC_API_KEY)
 python scraper.py --years 5            # backfill the five most recent year sections
 python scraper.py --max-files 1        # cap new files this run (testing)
+python scraper.py --no-llm --years 20  # live run without Claude (local fetch of files runners can't reach)
 ```
