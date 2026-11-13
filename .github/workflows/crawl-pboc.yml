@@ -20,7 +20,7 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Check ANTHROPIC_API_KEY secret
         env:

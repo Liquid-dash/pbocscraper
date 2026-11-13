@@ -41,6 +41,12 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 PROCESSED_PATH = DATA_DIR / "processed_urls.json"
 MASTER_PATH = DATA_DIR / "pboc_master_data.xlsx"
+TRANSLATIONS_PATH = DATA_DIR / "translations.json"
+STATE_PATH = DATA_DIR / "state.json"
+
+BACKFILL_YEARS = 20       # one-time history crawl on the first live run
+BACKFILL_MAX_ATTEMPTS = 3  # stop re-running the backfill if some old files keep failing
+TRANSLATE_BATCH = 100
 
 KEY_COLUMNS = ["dataset", "item", "measure", "period"]
 MASTER_COLUMNS = [
@@ -70,6 +76,15 @@ class SelectedAttachment(BaseModel):
 
 class AttachmentSelection(BaseModel):
     attachments: list[SelectedAttachment]
+
+
+class Translation(BaseModel):
+    source: str = Field(description="The label exactly as given")
+    english: str = Field(description="English-only label")
+
+
+class TranslationBatch(BaseModel):
+    translations: list[Translation]
 
 
 class SheetLayout(BaseModel):
@@ -124,6 +139,10 @@ def norm_period(value) -> str | None:
     if isinstance(value, (pd.Timestamp, datetime)):
         return f"{value.year}-{value.month:02d}"
     s = str(value).strip()
+    m = re.match(r"^(\d{4})\s*[.\-/年]?\s*(?:Q|第)\s*([1-4一二三四])\s*(?:季度)?$", s, re.I)
+    if m:
+        q = "1234"["一二三四".index(m.group(2))] if m.group(2) in "一二三四" else m.group(2)
+        return f"{m.group(1)}-Q{q}"
     m = re.match(r"^(\d{4})\s*[.\-/年]\s*(\d{1,2})(?:\s*月)?$", s)
     if m and 1 <= int(m.group(2)) <= 12:
         return f"{m.group(1)}-{int(m.group(2)):02d}"
@@ -143,6 +162,48 @@ def norm_period_sequence(values: list) -> list[str | None]:
         if isinstance(raw, float) and p.endswith("-01") and prev == f"{p[:4]}-09":
             out[i] = p = f"{p[:4]}-10"
         prev = p
+    return out
+
+
+def to_number(values) -> pd.Series:
+    """Numeric conversion tolerant of text cells like '2431022.72\\xa0' or '1,234.5'."""
+    s = pd.Series(values)
+    s = s.map(lambda v: re.sub(r"[\s,]", "", v) if isinstance(v, str) else v)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def html_tables(content: bytes) -> dict[str, pd.DataFrame]:
+    """Grid DataFrames from an HTML page's <table>s, laid out like read_excel(header=None):
+    a merged (colspan/rowspan) cell's text sits only at its top-left position. Older years
+    (pre-2015) publish tables only as Excel-exported .htm pages, usually GB2312-encoded."""
+    from lxml import html as lxml_html
+    m = re.search(rb"charset\s*=\s*[\"']?([\w-]+)", content[:4096], re.I)
+    charset = (m.group(1).decode() if m else "utf-8").lower()
+    if charset in ("gb2312", "gbk", "gb18030"):
+        charset = "gb18030"
+    doc = lxml_html.fromstring(content.decode(charset, errors="replace"))
+    out: dict[str, pd.DataFrame] = {}
+    for t_idx, table in enumerate(doc.iter("table")):
+        cells: dict[tuple[int, int], str] = {}
+        taken: set[tuple[int, int]] = set()
+        n_rows = n_cols = 0
+        for r, tr in enumerate(table.xpath("./tr|./thead/tr|./tbody/tr")):
+            c = 0
+            for td in tr.xpath("./td|./th"):
+                while (r, c) in taken:
+                    c += 1
+                cs, rs = int(td.get("colspan", 1) or 1), int(td.get("rowspan", 1) or 1)
+                taken.update((r + i, c + j) for i in range(rs) for j in range(cs))
+                text = re.sub(r"\s+", " ", td.text_content()).strip()
+                if text:
+                    cells[(r, c)] = text
+                c += cs
+                n_cols = max(n_cols, c)
+            n_rows = r + 1
+        if n_rows < 3 or not cells:
+            continue
+        grid = [[cells.get((r, c)) for c in range(n_cols)] for r in range(n_rows)]
+        out[f"table{t_idx}"] = pd.DataFrame(grid, dtype=object)
     return out
 
 
@@ -183,13 +244,52 @@ def save_processed(urls: set[str]) -> None:
                               encoding="utf-8")
 
 
-def upsert_master(new: pd.DataFrame) -> int:
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
+
+
+def save_json(path: Path, obj) -> None:
     DATA_DIR.mkdir(exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+CJK = re.compile(r"[㐀-鿿＀-￯]")
+TRANSLATED_COLUMNS = ["table_title", "item", "measure", "unit"]
+
+
+def translate_columns(df: pd.DataFrame, selector, cache: dict[str, str]) -> pd.DataFrame:
+    """Replace Chinese labels with English. `cache` (data/translations.json) keeps every
+    label's translation fixed across runs, since item/measure are part of the upsert key."""
+    labels = sorted({v for c in TRANSLATED_COLUMNS if c in df
+                     for v in df[c].dropna().astype(str) if CJK.search(v)})
+    missing = [l for l in labels if l not in cache]
+    for i in range(0, len(missing), TRANSLATE_BATCH):
+        cache.update(selector.translate(missing[i:i + TRANSLATE_BATCH],
+                                        sorted(set(cache.values()))))
+    still = [l for l in missing if l not in cache]
+    if still:
+        log.warning("%d label(s) left untranslated, e.g. %s", len(still), still[:5])
+    df = df.copy()
+    for c in TRANSLATED_COLUMNS:
+        if c in df:
+            df[c] = df[c].map(lambda v: cache.get(v, v) if isinstance(v, str) else v)
+    return df
+
+
+def merge_with_master(new: pd.DataFrame) -> pd.DataFrame:
     if MASTER_PATH.exists():
         old = pd.read_excel(MASTER_PATH, dtype={"period": str})
-        merged = pd.concat([old, new], ignore_index=True)
-    else:
-        merged = new
+        return pd.concat([old, new], ignore_index=True)
+    return new
+
+
+def write_master(merged: pd.DataFrame) -> int:
+    DATA_DIR.mkdir(exist_ok=True)
     merged = (merged.drop_duplicates(subset=KEY_COLUMNS, keep="last")
                     .sort_values(KEY_COLUMNS)
                     .reset_index(drop=True))[MASTER_COLUMNS]
@@ -259,9 +359,16 @@ def collect_category_pages(page, years: int) -> list[Link]:
 
 def collect_attachments(page, category: Link) -> list[Link]:
     goto(page, category.url)
-    raw = page.eval_on_selector_all("a[href*='attachDir']", LINK_JS)
-    return [Link(text=t, url=h, context=row) for t, h, row in raw
-            if re.search(r"\.xlsx?$", h, re.I)]
+    # Recent files live under /attachDir/, older ones (pre-2019) under /fileDir/resource/cms/.
+    # Before 2015 tables are only published as .htm pages; use one only when its row has no
+    # .xls(x) link.
+    raw = page.eval_on_selector_all("a[href]", LINK_JS)
+    sheets = [Link(text=t, url=h, context=row) for t, h, row in raw
+              if re.search(r"\.xlsx?$", h, re.I)]
+    rows_with_sheet = {l.context for l in sheets}
+    pages = [Link(text=t, url=h, context=row) for t, h, row in raw
+             if re.search(r"/fileDir/.+\.htm$", h, re.I) and row not in rows_with_sheet]
+    return sheets + pages
 
 
 def download(page, url: str) -> bytes:
@@ -330,10 +437,35 @@ class ClaudeSelector:
             "across columns or down rows, which columns hold item names or periods, the unit "
             "note (单位/Unit) and the table title. Bilingual tables often put an English "
             "label on the row below each Chinese label; those English-only rows are not "
-            "separate data rows.\n\n"
+            "separate data rows. If the sheet holds more than one table (e.g. a supplementary "
+            "'adjusted' table or a growth-rate table below the notes), describe only the first, "
+            "main table and set footer_start_row to where it ends.\n\n"
             f"{sheet_to_grid_text(df)}"
         )
         return self._parse(prompt, SheetLayout)
+
+    def translate(self, labels: list[str], known: list[str]) -> dict[str, str]:
+        listing = "\n".join(f"- {l}" for l in labels)
+        vocab = "\n".join(f"- {k}" for k in known)
+        prompt = (
+            "Translate these labels from People's Bank of China statistical tables (money "
+            "supply and Aggregate Financing to the Real Economy) into concise English, using "
+            "the terminology of the PBoC's own English releases (e.g. 货币和准货币（M2） -> "
+            "'Money and quasi-money (M2)', 社会融资规模存量 -> 'AFRE (stock)', 存量 -> 'Stock', "
+            "增速（%） -> 'Growth Rate (%)', 单位：亿元人民币 -> '100 million yuan'). If a label "
+            "already contains an English version, return just that English part, tidied. "
+            "Units: return only the unit, without a 'Unit:' prefix. Drop 'of which' / 其中 "
+            "prefixes and footnote markers. The same series is labelled slightly differently "
+            "across years, so translate equivalent labels identically, and when a label means "
+            "the same as one of the existing English labels below, return that existing label "
+            "exactly. Translate every label; copy each source exactly as given.\n\n"
+            f"Existing English labels:\n{vocab or '(none yet)'}\n\n"
+            f"Labels:\n{listing}"
+        )
+        wanted = set(labels)
+        out = self._parse(prompt, TranslationBatch).translations
+        return {t.source: t.english.strip() for t in out
+                if t.source in wanted and t.english.strip() and not CJK.search(t.english)}
 
 
 class HeuristicSelector:
@@ -347,10 +479,12 @@ class HeuristicSelector:
         for l in links:
             if re.search(r"货币供应量|Money Supply", l.context):
                 out.append((l, "money_supply"))
-            elif re.search(r"社会融资规模增量", l.context):
-                out.append((l, "afre_flow"))
+            elif re.search(r"地区", l.context):
+                continue  # regional breakdowns
             elif re.search(r"社会融资规模存量", l.context):
                 out.append((l, "afre_stock"))
+            elif re.search(r"社会融资规模(增量)?统计表", l.context):  # 2012 omits 增量
+                out.append((l, "afre_flow"))
         return out
 
     def detect_layout(self, df: pd.DataFrame, title_hint: str) -> SheetLayout:
@@ -360,13 +494,22 @@ class HeuristicSelector:
                        if re.match(r"^\s*(注|Note)", str(df.iat[r, 0]))), None)
         unit = next((clean_label(v) for v in df.to_numpy().ravel()
                      if re.match(r"^\s*(单位|Unit)", str(v))), None)
-        if row_counts.max() >= col_counts.max():
-            hr = int(row_counts.idxmax())
+        # Sheets can hold a supplementary table below the main one (in either orientation),
+        # so pick whichever orientation's table starts first, not the one with most periods.
+        header_rows = [r for r in range(len(df)) if row_counts.iat[r] >= 3]
+        pc_best = int(col_counts.idxmax())
+        col_start = (int(is_period.iloc[:, pc_best].to_numpy().argmax())
+                     if col_counts.max() >= 3 else None)
+        use_columns = bool(header_rows) and (col_start is None or header_rows[0] <= col_start)
+        if not header_rows and col_start is None:
+            use_columns = row_counts.max() >= col_counts.max()
+        if use_columns:
+            hr = header_rows[0] if header_rows else int(row_counts.idxmax())
             first_period_col = int(is_period.iloc[hr].to_numpy().argmax())
             label_cols = list(range(first_period_col))
             value_cols = df.columns[first_period_col:]
             # First row whose label columns hold text and value columns hold numbers.
-            numeric = df[value_cols].apply(pd.to_numeric, errors="coerce").notna().any(axis=1)
+            numeric = df[value_cols].apply(to_number).notna().any(axis=1)
             data_start = next((r for r in range(hr + 1, len(df)) if numeric.iat[r]), hr + 1)
             # Sub-column labels: the populated header row nearest the data, if any.
             measure_row = None
@@ -390,6 +533,9 @@ class HeuristicSelector:
                            data_start_row=first, footer_start_row=footer, measure_row=None,
                            label_columns=[], period_column=pc, unit_note=unit,
                            table_title=title_hint)
+
+    def translate(self, labels: list[str], known: list[str]) -> dict[str, str]:
+        return {}  # dry run: only labels already in data/translations.json get translated
 
 
 # --------------------------------------------------------------------------- reshaping
@@ -441,14 +587,17 @@ def reshape(df: pd.DataFrame, layout: SheetLayout) -> pd.DataFrame:
             for c, item in items.items():
                 rows.append((item, "value", p, df.iat[r, c]))
     out = pd.DataFrame(rows, columns=["item", "measure", "period", "value"])
-    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out["value"] = to_number(out["value"]).to_numpy()
     return out.dropna(subset=["value"]).reset_index(drop=True)
 
 
 def process_file(selector, content: bytes, link: Link, dataset: str,
                  source_page: str) -> pd.DataFrame:
     frames = []
-    sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
+    if re.search(r"\.html?$", link.url, re.I):
+        sheets = html_tables(content)
+    else:
+        sheets = pd.read_excel(io.BytesIO(content), sheet_name=None, header=None)
     for name, df in sheets.items():
         if df.dropna(how="all").empty:
             continue
@@ -501,6 +650,14 @@ def run(dry_run: bool, years: int, max_files: int | None) -> int:
             return 2
         selector = ClaudeSelector()
 
+    state = load_json(STATE_PATH, {})
+    backfilling = not dry_run and not state.get("backfill_complete")
+    if backfilling:
+        years = max(years, BACKFILL_YEARS)
+        state["backfill_attempts"] = state.get("backfill_attempts", 0) + 1
+        log.info("One-time backfill: crawling the latest %d year sections (attempt %d/%d)",
+                 years, state["backfill_attempts"], BACKFILL_MAX_ATTEMPTS)
+
     processed = load_processed()
     retrieved_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     frames: list[pd.DataFrame] = []
@@ -549,7 +706,9 @@ def run(dry_run: bool, years: int, max_files: int | None) -> int:
             browser.close()
 
     new = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=MASTER_COLUMNS)
+    translations = load_json(TRANSLATIONS_PATH, {})
     if dry_run:
+        new = translate_columns(new, selector, translations)
         log.info("DRY RUN result: %d records from %d file(s), %d failure(s)",
                  len(new), len(done_urls), failures)
         if not new.empty:
@@ -559,11 +718,25 @@ def run(dry_run: bool, years: int, max_files: int | None) -> int:
                 print(new.groupby("dataset")["period"].agg(["min", "max", "count"]))
         return 1 if failures else 0
 
-    if not new.empty:
-        total = upsert_master(new[MASTER_COLUMNS])
-        log.info("Upserted %d records; master now has %d rows", len(new), total)
+    merged = merge_with_master(new[MASTER_COLUMNS])
+    # Translating the merged frame also converts rows already in the master, and must
+    # happen before de-duplication so old Chinese keys collapse onto the English ones.
+    n_known = len(translations)
+    translated = translate_columns(merged, selector, translations)
+    if not new.empty or not translated.equals(merged):
+        total = write_master(translated)
+        log.info("Upserted %d new records; master now has %d rows", len(new), total)
+    if len(translations) != n_known:
+        save_json(TRANSLATIONS_PATH, translations)
     if done_urls:
         save_processed(processed | set(done_urls))
+    if backfilling:
+        if failures == 0 or state["backfill_attempts"] >= BACKFILL_MAX_ATTEMPTS:
+            state["backfill_complete"] = True
+            state["backfill_years"] = years
+            log.info("Backfill complete (%d failure(s)); later runs crawl only the latest "
+                     "year unless --years says otherwise", failures)
+        save_json(STATE_PATH, state)
     log.info("Done: %d file(s) processed, %d failure(s)", len(done_urls), failures)
     return 1 if failures else 0
 

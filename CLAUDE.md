@@ -12,6 +12,8 @@ long-format master spreadsheet in `data/`.
 | `scraper.py` | The whole pipeline (single file, CLI entry point) |
 | `data/pboc_master_data.xlsx` | Master dataset, sheet `data`, upserted each run |
 | `data/processed_urls.json` | Attachment URLs already ingested (idempotency) |
+| `data/translations.json` | Fixed Chinese → English label translations |
+| `data/state.json` | One-time 20-year backfill status |
 | `.github/workflows/crawl-pboc.yml` | Mon + Thu 08:00 UTC and manual runs; commits `data/` to `main` |
 
 ## Site structure (as observed Nov 2026)
@@ -21,7 +23,16 @@ long-format master spreadsheet in `data/`.
 - Category pages list tables in `<tr>` rows: title (Chinese + English) plus `htm` / `xls` / `pdf`
   links pointing at `/diaochatongjisi/attachDir/YYYY/MM/<timestamp>.xls(x)`. The link text is just
   `xls`, so the **row text is the only description** of a file.
-- Money Supply (`货币供应量`) lives under `货币统计概览`; AFRE flow/stock under `社会融资规模`.
+  Older files (roughly pre-2019) live under `/diaochatongjisi/fileDir/resource/cms/YYYY/MM/` instead,
+  so attachments are matched by `.xls(x)` extension, not path. Before 2015 there is no xls at all,
+  only an Excel-exported `.htm` page (GB2312); `collect_attachments` takes the `.htm` link only for
+  rows without an xls, and `html_tables()` turns it into a read_excel-style grid (merged-cell text
+  only at its top-left cell, so English label rows don't pick up copied numbers). Needs `lxml`.
+- Money Supply (`货币供应量`) lives under `货币统计概览`; AFRE flow/stock under `社会融资规模`
+  (AFRE pages exist from 2012).
+- Sheet quirks seen in older years: numbers stored as text with trailing `\xa0` (handled by
+  `to_number()`), and extra tables below the notes (a growth-rate table, or a supplementary
+  "adjusted" table with months down the rows in a different unit). Only the first, main table is read.
 - Each year's file is cumulative (Jan..latest month) and is re-published under a **new URL** every
   month, so a new URL means new data and overlapping periods are expected.
 
@@ -39,21 +50,34 @@ long-format master spreadsheet in `data/`.
 4. **Detect layout** with Claude (`SheetLayout`): orientation (`periods_in_columns` vs
    `periods_in_rows`), header/data/footer rows, optional `measure_row` for periods spanning several
    sub-columns (e.g. Stock / Growth Rate), item-label columns, unit note, title.
+   If the model's layout yields 0 values, `HeuristicSelector`'s layout is tried instead; a file that
+   still yields nothing is a failure (not marked processed).
 5. **Reshape** deterministically (`reshape()`) into rows of
    `dataset, table_title, item, measure, period, value, unit, sheet, source_url, source_page, retrieved_at_utc`.
-6. **Upsert** into the master on key `(dataset, item, measure, period)` (last write wins), then add
+6. **Translate** Chinese labels in `table_title, item, measure, unit` to English (`translate()`,
+   `TranslationBatch`). Translations are cached in `data/translations.json` and never re-asked, so a
+   label always maps to the same English (item/measure are key columns). The whole merged master is
+   translated, so older Chinese rows collapse onto their English keys.
+7. **Upsert** into the master on key `(dataset, item, measure, period)` (last write wins), then add
    the file URLs to `processed_urls.json`.
+
+## One-time backfill
+
+`data/state.json` tracks a one-time history crawl (the index only goes back to 2008, so 20 sections = all available years). Until `backfill_complete` is true, live runs crawl
+`BACKFILL_YEARS` (20) year sections regardless of `--years`. It is marked complete after a run with
+no failures, or after `BACKFILL_MAX_ATTEMPTS` (3) attempts; after that runs crawl `--years`
+(default 1, i.e. the latest year only). Delete `data/state.json` to backfill again.
 
 ## Rules
 
-- **LLM decides layout, code moves data.** Claude only returns row/column indices and labels;
-  numeric values are always read by pandas from the sheet. Never ask the model to transcribe numbers.
+- **LLM decides layout, code moves data.** Claude only returns row/column indices, labels and label
+  translations; numeric values are always read by pandas from the sheet. Never ask the model to transcribe numbers.
 - **Idempotent runs.** A file URL is added to `processed_urls.json` only after its data is written.
   Failed files are left out so the next run retries them. Re-running with nothing new is a no-op.
 - **Write atomically.** The master is written to a temp file and renamed.
 - **Be polite to pbc.gov.cn.** Keep the 2-5 s randomized delay between every page load and download;
   don't parallelize requests.
-- **Periods are normalized to `YYYY-MM`** (or `YYYY` for annual). Excel may store `2026.10` as the
+- **Periods are normalized to `YYYY-MM`** (`YYYY-Qn` for quarterly, e.g. 2015 AFRE stock; `YYYY` for annual). Excel may store `2026.10` as the
   float `2026.1`; `norm_period_sequence()` resolves that from the preceding month, so always
   normalize a whole header/column at once, not cell by cell.
 - **`--dry-run` must work without `ANTHROPIC_API_KEY`** and must not write to `data/`. It swaps in
