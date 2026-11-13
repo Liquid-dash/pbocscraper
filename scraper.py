@@ -457,6 +457,14 @@ def process_file(selector, content: bytes, link: Link, dataset: str,
             log.info("  sheet %s: no data table, skipped", name)
             continue
         long = reshape(df, layout)
+        if long.empty and not isinstance(selector, HeuristicSelector):
+            log.warning("  sheet %s: model layout extracted 0 values: %s",
+                        name, layout.model_dump_json())
+            fallback = HeuristicSelector().detect_layout(df, link.context)
+            fallback_long = reshape(df, fallback)
+            if not fallback_long.empty:
+                log.warning("  sheet %s: using heuristic layout instead", name)
+                layout, long = fallback, fallback_long
         log.info("  sheet %s: %s, header r%d, measure r%s, data r%d-%s, unit=%r -> %d values",
                  name, layout.orientation, layout.header_row, layout.measure_row,
                  layout.data_start_row, layout.footer_start_row, layout.unit_note, len(long))
@@ -471,9 +479,12 @@ def process_file(selector, content: bytes, link: Link, dataset: str,
         long["source_url"] = link.url
         long["source_page"] = source_page
         frames.append(long)
-    if not frames:
-        return pd.DataFrame(columns=MASTER_COLUMNS)
-    return pd.concat(frames, ignore_index=True)
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if out.empty:
+        # A selected file must yield data; failing keeps it out of processed_urls.json
+        # so the next run retries it instead of silently skipping it forever.
+        raise RuntimeError(f"No values extracted from {link.url}")
+    return out
 
 
 # --------------------------------------------------------------------------- main
