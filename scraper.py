@@ -409,22 +409,36 @@ def collect_attachments(page, category: Link) -> list[Link]:
 
 
 def https(url: str) -> str:
-    """Old pages link files over http://; fetched via Playwright's request API that 404s,
-    while https:// works. Also keeps processed_urls.json free of http/https duplicates."""
+    """Canonical https:// form of a pbc.gov.cn URL, so processed_urls.json has no http/https
+    duplicates. download() still falls back to http:// when https:// 404s."""
     return re.sub(r"^http://(www\.)?pbc\.gov\.cn/", "https://www.pbc.gov.cn/", url)
 
 
 def download(page, url: str) -> bytes:
-    # The site intermittently 404s on files that exist, so retry like goto() does.
+    """The old /eportal/ files 404 over http:// from some places/times and over https://
+    from others (seen both ways on GitHub runners and locally), so each attempt tries both
+    schemes, and a plain browser navigation is the last resort."""
+    alt = re.sub(r"^https://", "http://", url) if url.startswith("https://") else https(url)
+    status = None
     for attempt in range(1, GOTO_ATTEMPTS + 1):
-        resp = page.request.get(url, timeout=90_000)
-        if resp.ok:
-            return resp.body()
-        if attempt == GOTO_ATTEMPTS:
-            raise RuntimeError(f"Download {url} failed: HTTP {resp.status}")
-        log.warning("Download %s: HTTP %d (attempt %d/%d)", url, resp.status, attempt,
-                    GOTO_ATTEMPTS)
-        time.sleep(10 * attempt)
+        for candidate in dict.fromkeys([url, alt]):
+            resp = page.request.get(candidate, timeout=90_000)
+            if resp.ok:
+                return resp.body()
+            status = resp.status
+        log.warning("Download %s: HTTP %s over http and https (attempt %d/%d)", url, status,
+                    attempt, GOTO_ATTEMPTS)
+        if attempt < GOTO_ATTEMPTS:
+            time.sleep(10 * attempt)
+    for candidate in dict.fromkeys([url, alt]):
+        try:
+            resp = page.goto(candidate, wait_until="domcontentloaded", timeout=60_000)
+            if resp is not None and resp.ok:
+                return resp.body()
+        except Exception as exc:
+            log.warning("Download %s via navigation failed: %s", candidate,
+                        str(exc).splitlines()[0])
+    raise RuntimeError(f"Download {url} failed: HTTP {status}")
 
 
 # --------------------------------------------------------------------------- Claude
