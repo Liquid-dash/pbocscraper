@@ -25,6 +25,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,7 @@ STATE_PATH = DATA_DIR / "state.json"
 BACKFILL_YEARS = 20       # one-time history crawl on the first live run
 BACKFILL_MAX_ATTEMPTS = 3  # stop re-running the backfill if some old files keep failing
 TRANSLATE_BATCH = 100
+CROSS_CHECK_RATIO = 0.5    # use the heuristic layout if the model's yields < half its values
 
 KEY_COLUMNS = ["dataset", "item", "measure", "period"]
 MASTER_COLUMNS = [
@@ -277,7 +279,42 @@ def translate_columns(df: pd.DataFrame, selector, cache: dict[str, str]) -> pd.D
     df = df.copy()
     for c in TRANSLATED_COLUMNS:
         if c in df:
-            df[c] = df[c].map(lambda v: cache.get(v, v) if isinstance(v, str) else v)
+            df[c] = df[c].map(lambda v: normalize_label(cache.get(v, v))
+                              if isinstance(v, str) else v)
+    return canonicalize_labels(df)
+
+
+AFRE_TOTAL = {"afre_flow": "Aggregate Financing to the Real Economy (Flow)",
+              "afre_stock": "Aggregate Financing to the Real Economy (Stock)"}
+
+
+def normalize_label(s: str) -> str:
+    """Deterministic cleanup so equivalent labels compare equal: full-width -> ASCII,
+    'Growth Rate(%)' -> 'Growth Rate (%)', whitespace, and 'Of which:' prefixes."""
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s*\(\s*", " (", s)
+    s = re.sub(r"\s*\)", ")", s).strip()
+    stripped = re.sub(r"^(of which|其中)\s*[:：,]?\s*", "", s, flags=re.I)
+    return stripped or s
+
+
+def canonicalize_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Labels that differ only in case collapse to their most common spelling, and each
+    AFRE dataset's headline series gets a single name (years label it differently)."""
+    if "item" in df and "dataset" in df:
+        is_total = df["item"].astype(str).str.match(
+            r"(?i)^(aggregate financing to the real economy|afre)\b")
+        for ds, name in AFRE_TOTAL.items():
+            df.loc[is_total & (df["dataset"] == ds), "item"] = name
+    for c in TRANSLATED_COLUMNS:
+        if c not in df:
+            continue
+        counts = df[c].dropna().astype(str).value_counts()
+        best: dict[str, str] = {}
+        for label in sorted(counts.index, key=lambda l: (-counts[l], l)):
+            best.setdefault(label.casefold(), label)
+        df[c] = df[c].map(lambda v: best.get(v.casefold(), v) if isinstance(v, str) else v)
     return df
 
 
@@ -362,7 +399,7 @@ def collect_attachments(page, category: Link) -> list[Link]:
     # Recent files live under /attachDir/, older ones (pre-2019) under /fileDir/resource/cms/.
     # Before 2015 tables are only published as .htm pages; use one only when its row has no
     # .xls(x) link.
-    raw = page.eval_on_selector_all("a[href]", LINK_JS)
+    raw = [(t, https(h), row) for t, h, row in page.eval_on_selector_all("a[href]", LINK_JS)]
     sheets = [Link(text=t, url=h, context=row) for t, h, row in raw
               if re.search(r"\.xlsx?$", h, re.I)]
     rows_with_sheet = {l.context for l in sheets}
@@ -371,11 +408,23 @@ def collect_attachments(page, category: Link) -> list[Link]:
     return sheets + pages
 
 
+def https(url: str) -> str:
+    """Old pages link files over http://; fetched via Playwright's request API that 404s,
+    while https:// works. Also keeps processed_urls.json free of http/https duplicates."""
+    return re.sub(r"^http://(www\.)?pbc\.gov\.cn/", "https://www.pbc.gov.cn/", url)
+
+
 def download(page, url: str) -> bytes:
-    resp = page.request.get(url, timeout=90_000)
-    if not resp.ok:
-        raise RuntimeError(f"Download {url} failed: HTTP {resp.status}")
-    return resp.body()
+    # The site intermittently 404s on files that exist, so retry like goto() does.
+    for attempt in range(1, GOTO_ATTEMPTS + 1):
+        resp = page.request.get(url, timeout=90_000)
+        if resp.ok:
+            return resp.body()
+        if attempt == GOTO_ATTEMPTS:
+            raise RuntimeError(f"Download {url} failed: HTTP {resp.status}")
+        log.warning("Download %s: HTTP %d (attempt %d/%d)", url, resp.status, attempt,
+                    GOTO_ATTEMPTS)
+        time.sleep(10 * attempt)
 
 
 # --------------------------------------------------------------------------- Claude
@@ -420,7 +469,8 @@ class ClaudeSelector:
             "- afre_flow: Aggregate Financing to the Real Economy flow (社会融资规模增量)\n"
             "- afre_stock: Aggregate Financing to the Real Economy stock (社会融资规模存量)\n"
             "Ignore balance sheets, reserves, exchange rates, templates, calendars and anything "
-            "else, including regional or quarterly AFRE breakdowns.\n\n"
+            "else, including regional or quarterly AFRE breakdowns. Older years title the "
+            "flow table just 社会融资规模统计表 (no 增量); that is afre_flow.\n\n"
             f"Candidates:\n{listing}"
         )
         allowed = {l.url: l for l in links}
@@ -524,11 +574,13 @@ class HeuristicSelector:
         pc = int(col_counts.idxmax())
         first = int(is_period.iloc[:, pc].to_numpy().argmax())
         # Item header: nearest row above data with labels in most value columns.
-        hr = first - 1
-        for r in range(first - 1, -1, -1):
-            if df.iloc[r].drop(df.columns[pc]).notna().sum() >= (df.shape[1] - 1) / 2:
-                hr = r
-                break
+        # Prefer the Chinese label row: English sub-rows can be split over two rows
+        # (e.g. 'Foreign currency-denominated loans' / '(RMB equivalent)').
+        candidates = [r for r in range(max(0, first - 6), first)
+                      if df.iloc[r].drop(df.columns[pc]).notna().sum() >= (df.shape[1] - 1) / 2]
+        hr = max(candidates, key=lambda r: (
+            sum(bool(CJK.search(str(v))) for v in df.iloc[r].dropna()), r),
+            default=first - 1)
         return SheetLayout(contains_data=True, orientation="periods_in_rows", header_row=hr,
                            data_start_row=first, footer_start_row=footer, measure_row=None,
                            label_columns=[], period_column=pc, unit_note=unit,
@@ -606,13 +658,19 @@ def process_file(selector, content: bytes, link: Link, dataset: str,
             log.info("  sheet %s: no data table, skipped", name)
             continue
         long = reshape(df, layout)
-        if long.empty and not isinstance(selector, HeuristicSelector):
-            log.warning("  sheet %s: model layout extracted 0 values: %s",
-                        name, layout.model_dump_json())
-            fallback = HeuristicSelector().detect_layout(df, link.context)
-            fallback_long = reshape(df, fallback)
-            if not fallback_long.empty:
-                log.warning("  sheet %s: using heuristic layout instead", name)
+        if not isinstance(selector, HeuristicSelector):
+            # Cross-check: a model layout that misses most of the table (e.g. a header row
+            # that labels only one column) loses data silently, so compare with the heuristic.
+            try:
+                fallback = HeuristicSelector().detect_layout(df, link.context)
+                fallback_long = reshape(df, fallback)
+            except Exception as exc:
+                log.warning("  sheet %s: heuristic cross-check failed: %s", name, exc)
+                fallback_long = pd.DataFrame()
+            if len(long) < CROSS_CHECK_RATIO * len(fallback_long):
+                log.warning("  sheet %s: model layout gave %d values vs heuristic %d; using "
+                            "heuristic. Model layout: %s", name, len(long), len(fallback_long),
+                            layout.model_dump_json())
                 layout, long = fallback, fallback_long
         log.info("  sheet %s: %s, header r%d, measure r%s, data r%d-%s, unit=%r -> %d values",
                  name, layout.orientation, layout.header_row, layout.measure_row,
@@ -680,6 +738,15 @@ def run(dry_run: bool, years: int, max_files: int | None) -> int:
                 polite_delay()
                 atts = collect_attachments(page, cat)
                 chosen = selector.pick_attachments(atts) if atts else []
+                if atts and not isinstance(selector, HeuristicSelector):
+                    # Keyword matches the model missed (e.g. 2012's flow table, titled without
+                    # 增量) are added; the model's dataset tag wins where both picked a file.
+                    have = {l.url for l, _ in chosen}
+                    extra = [(l, ds) for l, ds in HeuristicSelector().pick_attachments(atts)
+                             if l.url not in have]
+                    for l, ds in extra:
+                        log.info("  keyword match added: %s -> %s", l.context[:50], ds)
+                    chosen = chosen + extra
                 for link, dataset in chosen:
                     log.info("  %s %s -> %s%s", cat.context, link.context[:50], dataset,
                              " (already processed)" if link.url in processed else "")

@@ -50,14 +50,20 @@ long-format master spreadsheet in `data/`.
 4. **Detect layout** with Claude (`SheetLayout`): orientation (`periods_in_columns` vs
    `periods_in_rows`), header/data/footer rows, optional `measure_row` for periods spanning several
    sub-columns (e.g. Stock / Growth Rate), item-label columns, unit note, title.
-   If the model's layout yields 0 values, `HeuristicSelector`'s layout is tried instead; a file that
-   still yields nothing is a failure (not marked processed).
+   **Cross-check:** every sheet is also parsed with `HeuristicSelector`'s layout; if the model's
+   layout yields under half as many values (`CROSS_CHECK_RATIO`), the heuristic's is used. (Live
+   run, Nov 2026: Claude took the merged `其中 Of which` row as the header of 2015/2018/2019 flow
+   sheets and kept 1 of 9 columns.) A file that still yields nothing is a failure (not marked
+   processed). Attachment picks are likewise the union of Claude's and the keyword matcher's.
 5. **Reshape** deterministically (`reshape()`) into rows of
    `dataset, table_title, item, measure, period, value, unit, sheet, source_url, source_page, retrieved_at_utc`.
 6. **Translate** Chinese labels in `table_title, item, measure, unit` to English (`translate()`,
    `TranslationBatch`). Translations are cached in `data/translations.json` and never re-asked, so a
    label always maps to the same English (item/measure are key columns). The whole merged master is
-   translated, so older Chinese rows collapse onto their English keys.
+   translated, so older Chinese rows collapse onto their English keys. After translation every
+   label goes through `normalize_label()` (NFKC, `Growth Rate(%)` -> `Growth Rate (%)`, drops
+   `Of which:`) and `canonicalize_labels()` (case variants collapse to the most common spelling;
+   each AFRE dataset's headline series gets one name from `AFRE_TOTAL`).
 7. **Upsert** into the master on key `(dataset, item, measure, period)` (last write wins), then add
    the file URLs to `processed_urls.json`.
 
