@@ -8,7 +8,7 @@ on:
       years:
         description: "Number of most recent year sections to crawl (use more to backfill)"
         required: false
-        default: "1"
+        default: "2"
 
 permissions:
   contents: write
@@ -51,7 +51,7 @@ jobs:
         continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scraper.py --years "${{ github.event.inputs.years || '1' }}"
+        run: python scraper.py --years "${{ github.event.inputs.years || '2' }}"
 
       # Commit whatever succeeded, even if some files failed (they retry next run).
       - name: Commit data updates

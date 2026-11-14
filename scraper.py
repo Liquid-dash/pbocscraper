@@ -858,8 +858,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--dry-run", action="store_true",
                     help="Test crawl + parse without the Claude API and without writing data/")
-    ap.add_argument("--years", type=int, default=1,
-                    help="How many of the most recent year sections to crawl (default 1)")
+    ap.add_argument("--years", type=int, default=2,
+                    help="How many of the most recent year sections to crawl (default 2: December data "
+                    "is published in January under the previous year)")
     ap.add_argument("--max-files", type=int, default=None,
                     help="Cap on new files processed this run")
     ap.add_argument("--no-llm", action="store_true",

@@ -41,7 +41,8 @@ long-format master spreadsheet in `data/`.
 1. **Crawl** (Playwright, headless Chromium, random 2-5 s delay between requests). Only HTML
    documents are loaded (`block_subresources` aborts scripts/CSS/images) with
    `wait_until="domcontentloaded"` and 3 attempts per page: the link tables are static HTML, but the
-   site's scripts take 30+ s and made `networkidle` time out on GitHub runners. `--years N` limits to the newest N year sections (default 1).
+   site's scripts take 30+ s and made `networkidle` time out on GitHub runners. `--years N` limits to the newest N year sections (default 2: each December's data is
+   published mid-January in the *previous* year's section, which a 1-year crawl could miss).
 2. **Select links** with Claude (`claude-haiku-4-5`, `client.messages.parse` + Pydantic):
    `PageSelection` for category pages, `AttachmentSelection` for spreadsheets (tags each as
    `money_supply` / `afre_flow` / `afre_stock`). Returned URLs are validated against the candidate
@@ -72,7 +73,7 @@ long-format master spreadsheet in `data/`.
 `data/state.json` tracks a one-time history crawl (the index only goes back to 2008, so 20 sections = all available years). Until `backfill_complete` is true, live runs crawl
 `BACKFILL_YEARS` (20) year sections regardless of `--years`. It is marked complete after a run with
 no failures, or after `BACKFILL_MAX_ATTEMPTS` (3) attempts; after that runs crawl `--years`
-(default 1, i.e. the latest year only). Delete `data/state.json` to backfill again.
+(default 2: the latest two year sections). Delete `data/state.json` to backfill again.
 
 The pre-2015 `/eportal/` `.htm` files 404 almost every time from GitHub runners (over both http
 and https) but load fine from a normal connection, so the Nov 2026 backfill fetched them locally
