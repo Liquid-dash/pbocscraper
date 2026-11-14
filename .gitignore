@@ -5,3 +5,4 @@ venv/
 .env
 data/*.tmp.xlsx
 ~$*.xlsx
+data/*.tmp

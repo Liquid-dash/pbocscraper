@@ -43,6 +43,8 @@ DATA_DIR = ROOT / "data"
 PROCESSED_PATH = DATA_DIR / "processed_urls.json"
 MASTER_PATH = DATA_DIR / "pboc_master_data.xlsx"
 TRANSLATIONS_PATH = DATA_DIR / "translations.json"
+WEB_JSON_PATH = DATA_DIR / "pboc_data.json"   # public, read by liquiditydashboard.net
+WEB_CSV_PATH = DATA_DIR / "pboc_data.csv"
 STATE_PATH = DATA_DIR / "state.json"
 
 BACKFILL_YEARS = 20       # one-time history crawl on the first live run
@@ -346,6 +348,58 @@ def same_content(a: pd.DataFrame, b: pd.DataFrame) -> bool:
         elif not a[c].fillna("").astype(str).equals(b[c].fillna("").astype(str)):
             return False
     return True
+
+
+def web_exports(final: pd.DataFrame) -> dict[Path, str]:
+    """Web-friendly copies of the master for liquiditydashboard.net (served from the public
+    repo via raw.githubusercontent.com). Deterministic text, so unchanged data gives
+    byte-identical files and no commit."""
+    df = final.copy()
+    # float + rounding: identical text whether the frame came from memory or an Excel read
+    # (which can return whole numbers as int64), and drops float noise from the source sheets.
+    df["value"] = pd.to_numeric(df["value"], errors="coerce").astype(float).round(6)
+    df = df.fillna({c: "" for c in MASTER_COLUMNS if c != "value"})
+    series = []
+    for (ds, item, measure), g in df.groupby(["dataset", "item", "measure"], sort=True):
+        g = g.sort_values("period")
+        units = sorted(g["unit"].dropna().astype(str).unique())
+        series.append({
+            "id": "/".join(re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+                           for s in (ds, item, measure)),
+            "dataset": ds, "item": item, "measure": measure,
+            "unit": units[0] if len(units) == 1 else units,
+            "first": g["period"].iloc[0], "last": g["period"].iloc[-1],
+            "data": [[p, None if pd.isna(v) else float(v)]
+                     for p, v in zip(g["period"], g["value"])],
+        })
+    payload = {
+        "source": "People's Bank of China, Statistics and Analysis Department",
+        "source_index": INDEX_URL,
+        "updated_at_utc": str(df["retrieved_at_utc"].dropna().max()),
+        "datasets": {"money_supply": "Money supply (M0, M1, M2)",
+                     "afre_flow": "Aggregate Financing to the Real Economy, flow (monthly increment)",
+                     "afre_stock": "Aggregate Financing to the Real Economy, stock (outstanding)"},
+        "series": series,
+    }
+    out = {WEB_JSON_PATH: json.dumps(payload, ensure_ascii=False, indent=1) + "\n",
+           # Data columns only: the repeated source URLs would triple the size of a file
+           # that is re-committed every month (provenance stays in the xlsx).
+           WEB_CSV_PATH: df[["dataset", "item", "measure", "period", "value", "unit"]]
+                         .to_csv(index=False, lineterminator="\n")}
+    return out
+
+
+def write_web_exports(final: pd.DataFrame) -> list[str]:
+    """Write the web files that differ from what's on disk; returns the names written."""
+    written = []
+    for path, text in web_exports(final).items():
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            continue
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        tmp.replace(path)
+        written.append(path.name)
+    return written
 
 
 def write_master(merged: pd.DataFrame) -> int:
@@ -839,6 +893,9 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
     elif not final.empty:
         total = write_master(final)
         log.info("Upserted %d new records; master now has %d rows", len(new), total)
+    if not final.empty:
+        written = write_web_exports(final)
+        log.info("Web exports: %s", ", ".join(written) if written else "unchanged")
     if len(translations) != n_known:
         save_json(TRANSLATIONS_PATH, translations)
     if done_urls:

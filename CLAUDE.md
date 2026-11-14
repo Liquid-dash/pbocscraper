@@ -14,6 +14,7 @@ long-format master spreadsheet in `data/`.
 | `data/processed_urls.json` | Attachment URLs already ingested (idempotency) |
 | `data/translations.json` | Fixed Chinese → English label translations |
 | `data/state.json` | One-time 20-year backfill status |
+| `data/pboc_data.json`, `data/pboc_data.csv` | Web exports read by liquiditydashboard.net (public raw URL) |
 | `.github/workflows/crawl-pboc.yml` | Mon + Thu 08:00 UTC and manual runs; commits `data/` to `main` |
 
 ## Site structure (as observed Nov 2026)
@@ -66,7 +67,12 @@ long-format master spreadsheet in `data/`.
    `Of which:`) and `canonicalize_labels()` (case variants collapse to the most common spelling;
    each AFRE dataset's headline series gets one name from `AFRE_TOTAL`).
 7. **Upsert** into the master on key `(dataset, item, measure, period)` (last write wins), then add
-   the file URLs to `processed_urls.json`.
+   the file URLs to `processed_urls.json`. The master is rewritten only when its content changed
+   (`same_content`), so a run with nothing new commits nothing.
+8. **Web exports** (`write_web_exports`): `pboc_data.json` (series with `[period, value]` pairs,
+   stable slug `id`s) and `pboc_data.csv` (data columns only). Deterministic text, written only when
+   it differs. liquiditydashboard.net fetches the JSON from raw.githubusercontent.com, so keep its
+   shape backward-compatible (add fields, don't rename `id`s or keys).
 
 ## One-time backfill
 
