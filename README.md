@@ -1,7 +1,8 @@
 # pbocscraper
 
-Twice-weekly scraper for People's Bank of China statistics: **money supply (M0, M1, M2)** and
-**Aggregate Financing to the Real Economy (AFRE, flow and stock)**, translated to English.
+Twice-weekly scraper for People's Bank of China statistics: **money supply (M0, M1, M2)**,
+**Aggregate Financing to the Real Economy (AFRE, flow and stock)** and the **Medium-term Lending
+Facility (MLF)**, translated to English.
 Runs on GitHub Actions every Monday and Thursday at 08:00 UTC and commits any new data.
 
 ## Data files
@@ -13,8 +14,11 @@ Runs on GitHub Actions every Monday and Thursday at 08:00 UTC and commits any ne
 | [`data/pboc_master_data.xlsx`](data/pboc_master_data.xlsx) | Full master incl. source file URLs and retrieval times |
 
 Coverage: money supply 2008-01 onwards, AFRE flow 2012-01 onwards, AFRE stock 2015 (quarterly)
-then monthly from 2016-01. Periods are `YYYY-MM` (`YYYY-Qn` for the 2015 quarterly stock).
-Units: money supply and AFRE flow in 100 million yuan; AFRE stock in trillion yuan; growth rates in %.
+then monthly from 2016-01. MLF: month-end outstanding balance from 2014-09 (published by the PBoC
+until 2025-05; later months are derived as last published balance + cumulative net injection and
+flagged with `derived_from` in the JSON), and monthly injection / withdrawal / net injection from
+2025-05. Periods are `YYYY-MM` (`YYYY-Qn` for the 2015 quarterly stock).
+Units: money supply, AFRE flow and MLF in 100 million yuan; AFRE stock in trillion yuan; growth rates in %.
 
 ### Using the JSON from a website
 

@@ -204,7 +204,7 @@ def html_tables(content: bytes) -> dict[str, pd.DataFrame]:
                 c += cs
                 n_cols = max(n_cols, c)
             n_rows = r + 1
-        if n_rows < 3 or not cells:
+        if n_rows < 2 or not cells:  # single-month MLF tables are header + 1 row
             continue
         grid = [[cells.get((r, c)) for c in range(n_cols)] for r in range(n_rows)]
         out[f"table{t_idx}"] = pd.DataFrame(grid, dtype=object)
@@ -363,7 +363,7 @@ def web_exports(final: pd.DataFrame) -> dict[Path, str]:
     for (ds, item, measure), g in df.groupby(["dataset", "item", "measure"], sort=True):
         g = g.sort_values("period")
         units = sorted(g["unit"].dropna().astype(str).unique())
-        series.append({
+        entry = {
             "id": "/".join(re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
                            for s in (ds, item, measure)),
             "dataset": ds, "item": item, "measure": measure,
@@ -371,14 +371,23 @@ def web_exports(final: pd.DataFrame) -> dict[Path, str]:
             "first": g["period"].iloc[0], "last": g["period"].iloc[-1],
             "data": [[p, None if pd.isna(v) else float(v)]
                      for p, v in zip(g["period"], g["value"])],
-        })
+        }
+        derived = g[g["sheet"] == DERIVED]
+        if not derived.empty:
+            entry["derived_from"] = derived["period"].iloc[0]
+            entry["note"] = (f"Values from {entry['derived_from']} are not published by the "
+                             "PBoC: last published value plus cumulative net injection.")
+        series.append(entry)
     payload = {
         "source": "People's Bank of China, Statistics and Analysis Department",
         "source_index": INDEX_URL,
         "updated_at_utc": str(df["retrieved_at_utc"].dropna().max()),
         "datasets": {"money_supply": "Money supply (M0, M1, M2)",
                      "afre_flow": "Aggregate Financing to the Real Economy, flow (monthly increment)",
-                     "afre_stock": "Aggregate Financing to the Real Economy, stock (outstanding)"},
+                     "afre_stock": "Aggregate Financing to the Real Economy, stock (outstanding)",
+                     "mlf": "Medium-term Lending Facility: month-end outstanding balance "
+                            "(published to 2025-05, derived after) and monthly injection, "
+                            "withdrawal and net injection (from 2025-05)"},
         "series": series,
     }
     out = {WEB_JSON_PATH: json.dumps(payload, ensure_ascii=False, indent=1) + "\n",
@@ -783,6 +792,123 @@ def process_file(selector, content: bytes, link: Link, dataset: str,
     return out
 
 
+# --------------------------------------------------------------------------- MLF
+
+# MLF is published by the Monetary Policy Department, not the statistics index, as small HTML
+# tables inside article pages (no spreadsheets), so it is parsed deterministically, no LLM.
+MLF_DATASET = "mlf"
+MLF_ITEM = "Medium-term Lending Facility (MLF)"
+MLF_UNIT = "100 million yuan"
+# Month-end outstanding balance, 2014-09 .. 2025-05 (the series stopped there).
+MLF_BALANCE_LIST = ("https://www.pbc.gov.cn/zhengcehuobisi/125207/125213/125437/125446/"
+                    "125876/index.html")
+# Monthly liquidity injection by tool (投放 / 回笼 / 净投放), 2025-05 onwards.
+MLF_INJECTION_LIST = "https://www.pbc.gov.cn/zhengcehuobisi/125207/125213/5727710/index.html"
+MLF_MEASURES = {"投放": "Injection", "回笼": "Withdrawal", "净投放": "Net injection"}
+DERIVED = "derived"  # `sheet` value marking computed rows (see derive_mlf_balance)
+
+
+def collect_article_links(page, list_url: str, all_pages: bool) -> list[Link]:
+    """Article links (title in `context`) from a PBoC list page and, if `all_pages`, from its
+    static pagination pages (<id>-2.html, <id>-3.html, ...). New articles appear first."""
+    base = list_url.rsplit("/", 1)[0] + "/"
+    goto(page, list_url)
+    pages = [list_url]
+    if all_pages:
+        path = re.sub(r"^https?://[^/]+", "", base)
+        found = re.findall(re.escape(path) + r"(\d+)-(\d+)\.html", page.content())
+        if found:
+            stem, last = found[0][0], max(int(n) for _, n in found)
+            pages += [f"{base}{stem}-{n}.html" for n in range(2, last + 1)]
+    links: dict[str, Link] = {}
+    for i, url in enumerate(pages):
+        if i:
+            polite_delay()
+            goto(page, url)
+        for text, href, _ in page.eval_on_selector_all("a[href]", LINK_JS):
+            href = https(href)
+            if href.startswith(base) and re.fullmatch(r"[\w]+/index\.html", href[len(base):]) \
+                    and re.search(r"\d{4}年", text):
+                links.setdefault(href, Link(text="article", url=href, context=text.strip()))
+    return list(links.values())
+
+
+def parse_mlf_article(content: bytes, link: Link) -> pd.DataFrame:
+    """Rows (item, measure, period, value) from an MLF balance table or a liquidity-injection
+    table. Raises if the page has neither, so the article is retried next run."""
+    rows = []
+    for df in html_tables(content).values():
+        text = df.astype(str)
+        if text.apply(lambda c: c.str.contains("中期借贷便利余额")).any().any():
+            periods = norm_period_sequence(df.iloc[:, 0].tolist())
+            for r, p in enumerate(periods):
+                if p and df.shape[1] > 1:
+                    rows.append((MLF_ITEM, "Outstanding balance", p, df.iat[r, 1]))
+        # 2018-05 is published as a maturity schedule (到期量 by month); its 合计 (total) row
+        # is the month-end balance for the month in the title.
+        if text.iloc[0].str.contains("到期量").any():
+            total = [r for r in range(len(df)) if str(df.iat[r, 0]).strip() == "合计"]
+            m = re.search(r"(\d{4})年(\d{1,2})月", link.context)
+            if total and m and df.shape[1] > 1:
+                rows.append((MLF_ITEM, "Outstanding balance",
+                             f"{m.group(1)}-{int(m.group(2)):02d}", df.iat[total[0], 1]))
+        mlf_rows = [r for r in range(len(df))
+                    if text.iloc[r].str.contains("中期借贷便利").any()
+                    and not text.iloc[r].str.contains("定向").any()]
+        header = next((r for r in range(len(df)) if text.iloc[r].str.fullmatch("净投放").any()), None)
+        if mlf_rows and header is not None:
+            m = re.search(r"(\d{4})年(\d{1,2})月", link.context)
+            if not m:
+                raise RuntimeError(f"No month in article title {link.context!r}")
+            period = f"{m.group(1)}-{int(m.group(2)):02d}"
+            for c in range(df.shape[1]):
+                label = str(df.iat[header, c]).strip()
+                if label in MLF_MEASURES:
+                    rows.append((MLF_ITEM, MLF_MEASURES[label], period, df.iat[mlf_rows[0], c]))
+    out = pd.DataFrame(rows, columns=["item", "measure", "period", "value"])
+    out["value"] = to_number(out["value"]).to_numpy()
+    out = out.dropna(subset=["value"]).reset_index(drop=True)
+    if out.empty:
+        raise RuntimeError(f"No MLF values found in {link.url}")
+    return out
+
+
+def mlf_frame(content: bytes, link: Link, source_page: str) -> pd.DataFrame:
+    df = parse_mlf_article(content, link)
+    df["dataset"] = MLF_DATASET
+    df["table_title"] = ("MLF operation table" if "Outstanding balance" in set(df["measure"])
+                         else "Central bank liquidity injection by tool")
+    df["unit"] = MLF_UNIT
+    df["sheet"] = "html"
+    df["source_url"] = link.url
+    df["source_page"] = source_page
+    return df
+
+
+def derive_mlf_balance(df: pd.DataFrame) -> pd.DataFrame:
+    """The PBoC stopped publishing the MLF balance after 2025-05. Extend it month by month as
+    last published balance + cumulative net injection, marked sheet='derived' and recomputed
+    from scratch every run (so a late or revised net injection flows through)."""
+    is_mlf = df["dataset"] == MLF_DATASET
+    df = df[~(is_mlf & (df["sheet"] == DERIVED))].copy()
+    bal = df[(df["dataset"] == MLF_DATASET) & (df["measure"] == "Outstanding balance")]
+    net = df[(df["dataset"] == MLF_DATASET) & (df["measure"] == "Net injection")]
+    if bal.empty or net.empty:
+        return df
+    bal = bal.drop_duplicates("period", keep="last").set_index("period")
+    net = net.drop_duplicates("period", keep="last").set_index("period")
+    last = max(p for p in bal.index if "Q" not in p)
+    level, period, rows = float(bal.loc[last, "value"]), pd.Period(last, "M"), []
+    while str(period + 1) in net.index:
+        period += 1
+        src = net.loc[str(period)]
+        level += float(src["value"])
+        rows.append({**{c: src.get(c) for c in MASTER_COLUMNS}, "period": str(period),
+                     "measure": "Outstanding balance", "value": level, "sheet": DERIVED,
+                     "table_title": f"Derived: {last} published balance + cumulative net injection"})
+    return pd.concat([df, pd.DataFrame(rows)], ignore_index=True) if rows else df
+
+
 # --------------------------------------------------------------------------- main
 
 def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) -> int:
@@ -802,6 +928,7 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
         selector = ClaudeSelector()
 
     state = load_json(STATE_PATH, {})
+    save_state = False
     backfilling = not dry_run and not state.get("backfill_complete")
     if backfilling:
         years = max(years, BACKFILL_YEARS)
@@ -862,13 +989,46 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
                 df["retrieved_at_utc"] = retrieved_at
                 frames.append(df)
                 done_urls.append(link.url)
+
+            # MLF (Monetary Policy Department article pages). First run walks every list
+            # page; later runs read page 1 of each list, where new articles appear.
+            mlf_all = not state.get("mlf_backfill_complete")
+            mlf_failures = 0
+            mlf_links: list[tuple[Link, str]] = []
+            for list_url in (MLF_BALANCE_LIST, MLF_INJECTION_LIST):
+                polite_delay()
+                try:
+                    mlf_links += [(l, list_url)
+                                  for l in collect_article_links(page, list_url, mlf_all)]
+                except Exception as exc:
+                    mlf_failures += 1
+                    log.exception("MLF list %s failed: %s", list_url, exc)
+            mlf_todo = [(l, s) for l, s in mlf_links if l.url not in processed]
+            log.info("MLF: %d article(s) listed, %d new%s", len(mlf_links), len(mlf_todo),
+                     " (full history)" if mlf_all else "")
+            for link, source_page in mlf_todo:
+                polite_delay()
+                try:
+                    df = mlf_frame(download(page, link.url), link, source_page)
+                except Exception as exc:
+                    mlf_failures += 1
+                    log.exception("Failed on MLF article %s: %s", link.url, exc)
+                    continue
+                log.info("  MLF %s -> %d values", link.context[:40], len(df))
+                df["retrieved_at_utc"] = retrieved_at
+                frames.append(df)
+                done_urls.append(link.url)
+            failures += mlf_failures
+            if mlf_all and mlf_failures == 0 and not dry_run:
+                state["mlf_backfill_complete"] = True
+                save_state = True
         finally:
             browser.close()
 
     new = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=MASTER_COLUMNS)
     translations = load_json(TRANSLATIONS_PATH, {})
     if dry_run:
-        new = translate_columns(new, selector, translations)
+        new = derive_mlf_balance(translate_columns(new, selector, translations))
         log.info("DRY RUN result: %d records from %d file(s), %d failure(s)",
                  len(new), len(done_urls), failures)
         if not new.empty:
@@ -882,7 +1042,7 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
     # Translating the merged frame also converts rows already in the master, and must
     # happen before de-duplication so old Chinese keys collapse onto the English ones.
     n_known = len(translations)
-    translated = translate_columns(merged, selector, translations)
+    translated = derive_mlf_balance(translate_columns(merged, selector, translations))
     # Rewrite only on a real content change: an unchanged run must leave the file untouched
     # so the workflow has nothing to commit (a re-saved .xlsx differs byte-wise).
     final = prepare_master(translated)
@@ -906,6 +1066,8 @@ def run(dry_run: bool, years: int, max_files: int | None, no_llm: bool = False) 
             state["backfill_years"] = years
             log.info("Backfill complete (%d failure(s)); later runs crawl only the latest "
                      "year unless --years says otherwise", failures)
+        save_state = True
+    if save_state:
         save_json(STATE_PATH, state)
     log.info("Done: %d file(s) processed, %d failure(s)", len(done_urls), failures)
     return 1 if failures else 0

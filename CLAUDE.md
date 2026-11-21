@@ -2,8 +2,9 @@
 
 Crawls the People's Bank of China Statistics & Analysis Department data index
 (http://www.pbc.gov.cn/diaochatongjisi/116219/116319/index.html) for **Money Supply (M0/M1/M2)**
-and **Aggregate Financing to the Real Economy (AFRE, flow and stock)**, and maintains a cleaned,
-long-format master spreadsheet in `data/`.
+and **Aggregate Financing to the Real Economy (AFRE, flow and stock)**, plus the Monetary Policy
+Department's **Medium-term Lending Facility (MLF)** pages, and maintains a cleaned, long-format
+master spreadsheet in `data/`.
 
 ## Layout
 
@@ -13,7 +14,7 @@ long-format master spreadsheet in `data/`.
 | `data/pboc_master_data.xlsx` | Master dataset, sheet `data`, upserted each run |
 | `data/processed_urls.json` | Attachment URLs already ingested (idempotency) |
 | `data/translations.json` | Fixed Chinese → English label translations |
-| `data/state.json` | One-time 20-year backfill status |
+| `data/state.json` | One-time backfill status (statistics years; MLF history) |
 | `data/pboc_data.json`, `data/pboc_data.csv` | Web exports read by liquiditydashboard.net (public raw URL) |
 | `.github/workflows/crawl-pboc.yml` | Mon + Thu 08:00 UTC and manual runs; commits `data/` to `main` |
 
@@ -36,6 +37,25 @@ long-format master spreadsheet in `data/`.
   "adjusted" table with months down the rows in a different unit). Only the first, main table is read.
 - Each year's file is cumulative (Jan..latest month) and is re-published under a **new URL** every
   month, so a new URL means new data and overlapping periods are expected.
+
+## MLF (dataset `mlf`)
+
+Not on the statistics index and not spreadsheets: small HTML tables inside Monetary Policy
+Department article pages, parsed deterministically (`parse_mlf_article`, no LLM) via `html_tables()`.
+
+| Source list | Period | Gives |
+|---|---|---|
+| `MLF_BALANCE_LIST` 中期借贷便利操作表 (`…/125446/125876/`, ~7 list pages) | 2014-09 .. 2025-05 | month-end `Outstanding balance` |
+| `MLF_INJECTION_LIST` 中央银行各项工具流动性投放情况 (`…/125213/5727710/`) | 2025-05 .. | `Injection` (投放), `Withdrawal` (回笼), `Net injection` (净投放); month from the article title |
+
+The PBoC stopped publishing the balance after 2025-05. `derive_mlf_balance()` extends it as last
+published balance + cumulative net injection, rows marked `sheet="derived"`, dropped and recomputed
+every run (stops at the first month without a net injection). The JSON export flags these with
+`derived_from`/`note`. The monthly 招标公告 (tender announcements, planned amount only) are not used;
+pre-2025 per-operation amounts/rates (in open-market announcements) are not captured.
+List pages paginate as static `<id>-N.html`. The first run walks every page
+(`state.json: mlf_backfill_complete`); later runs read page 1 of each list. Article URLs go in
+`processed_urls.json` like files.
 
 ## Pipeline
 
